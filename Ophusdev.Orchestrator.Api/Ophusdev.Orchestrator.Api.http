@@ -1,0 +1,6 @@
+@Ophusdev.Orchestrator.Api_HostAddress = http://localhost:5030
+
+GET {{Ophusdev.Orchestrator.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
