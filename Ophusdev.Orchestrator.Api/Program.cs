@@ -30,8 +30,6 @@ builder.Services.AddSingleton<IKafkaConsumer, KafkaConsumer>();
 
 builder.Services.AddScoped<IBookingService, BookingService>();
 
-builder.Services.AddScoped<IBookingSagaOrchestrator, BookingSagaOrchestrator>();
-
 builder.Services.AddKafkaTopicHandlers();
 
 builder.Services.AddHostedService<SagaConsumerService>();
