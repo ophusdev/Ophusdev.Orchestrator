@@ -1,0 +1,138 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x' # Cambia con la tua versione
+    
+    - name: Restore dependencies
+      run: dotnet restore
+    
+    - name: Build
+      run: dotnet build --configuration Release --no-restore
+    
+    - name: Test
+      run: dotnet test --configuration Release --no-build --verbosity normal
+
+  build-docker:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Generate version
+      id: version
+      run: |
+        # Estrai versione dal tag (es. v1.0.0 -> 1.0.0)
+        VERSION=${GITHUB_REF#refs/tags/}
+        VERSION=${VERSION#v}  # Rimuovi 'v' se presente
+        echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value=${{ steps.version.outputs.VERSION }}
+          type=raw,value=latest
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Ophusdev.Orchestrator.Api/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+  publish-nuget:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x' # Cambia con la tua versione
+    
+    - name: Restore dependencies
+      run: dotnet restore
+    
+    - name: Build
+      run: dotnet build --configuration Release --no-restore
+    
+    - name: Generate version
+      id: version
+      run: |
+        # Estrai versione dal tag (es. v1.0.0 -> 1.0.0)
+        VERSION=${GITHUB_REF#refs/tags/}
+        VERSION=${VERSION#v}  # Rimuovi 'v' se presente
+        echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+    
+    - name: Pack NuGet packages
+      run: |
+        dotnet pack --configuration Release --no-build --output ./nuget-packages \
+          -p:PackageVersion=${{ steps.version.outputs.VERSION }} \
+          -p:IncludeSymbols=true \
+          -p:SymbolPackageFormat=snupkg
+    
+    - name: Publish to NuGet
+      run: |
+        for package in ./nuget-packages/*.nupkg; do
+          echo "Publishing $(basename "$package")..."
+          dotnet nuget push "$package" \
+            --api-key ${{ secrets.NUGET_API_KEY }} \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate || echo "Failed to publish $(basename "$package") - continuing..."
+        done
+    
+    - name: Publish to GitHub Packages
+      run: |
+        for package in ./nuget-packages/*.nupkg; do
+          echo "Publishing $(basename "$package") to GitHub Packages..."
+          dotnet nuget push "$package" \
+            --api-key ${{ secrets.GITHUB_TOKEN }} \
+            --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json \
+            --skip-duplicate || echo "Failed to publish $(basename "$package") to GitHub Packages - continuing..."
+        done
