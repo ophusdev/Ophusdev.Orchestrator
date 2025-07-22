@@ -31,15 +31,15 @@ namespace Ophusdev.Orchestrator.Api.Controllers
                 return BadRequest("GuestId must be greater than 0.");
             }
 
-            try
-            {
-                BookingResponse response = await _business.CreateBookingSaga(bookingDto);
+            BookingResponse response = await _business.CreateBookingSaga(bookingDto);
 
-                return new JsonResult(response);
-            }
-            catch (RoomNotFoundException)
+            if (response.Status == BookingStatus.Paid)
             {
-                return BadRequest("RoomId not found");
+                return Ok(response);
+            }
+            else 
+            {
+                return BadRequest(response);
             }
         }
 

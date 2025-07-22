@@ -4,10 +4,10 @@ using Microsoft.Extensions.Logging;
 using Ophusdev.Kafka.Abstraction;
 using Ophusdev.Orchestrator.Business.Abstraction;
 using Ophusdev.Orchestrator.Shared;
-using Ophusdev.Orchestrator.Shared.Exceptions;
 using Ophusdev.Orchestrator.Shared.Models;
 using Orchestrator.Repository.Abstraction;
 using Orchestrator.Repository.Model;
+using System.Collections.Concurrent;
 
 namespace Ophusdev.Orchestrator.Business.Services
 {
@@ -19,6 +19,9 @@ namespace Ophusdev.Orchestrator.Business.Services
         private readonly IClientHttp _clientHttp;
         private readonly ITopicTranslator _topicTranslator;
         private readonly INotificationService _notificationService;
+        private readonly int _taskDelay = 60;
+
+        private static readonly ConcurrentDictionary<string, TaskCompletionSource<BookingResponse>> _completionSources = new();
 
         public BookingService(
             IKafkaProducer kafkaProducer,
@@ -52,7 +55,7 @@ namespace Ophusdev.Orchestrator.Business.Services
             return null;
         }
 
-        public async Task<BookingResponse> CreateBookingAsync(BookingInsertDto request)
+        public async Task<BookingResponse> CreateBookingAsync(BookingInsertDto request, CancellationToken cancellationToken = default)
         {
             string sagaId = Guid.NewGuid().ToString();
 
@@ -60,34 +63,58 @@ namespace Ophusdev.Orchestrator.Business.Services
 
             if (room == null)
             {
-                throw new RoomNotFoundException("Room is not available");
+                return new BookingResponse { BookingId = null, Status = BookingStatus.Failed, Message = "Room not found" };
             }
 
             BookingItem booking = await _bookingRepository.CreateBookingAsync(sagaId, request);
             await _bookingRepository.SaveChangesAsync();
 
+            var tcs = new TaskCompletionSource<BookingResponse>();
+
+            _completionSources.TryAdd(sagaId, tcs);
+
             _logger.LogInformation("Create saga transaction, sagaId={sagaId}", sagaId);
 
-            var inventoryRequest = new InventoryRequest
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_taskDelay));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+
+            try
             {
-                SagaId = sagaId,
-                BookingId = booking.BookingId,
-                RoomId = booking.RoomId,
-                CheckInDate = booking.CheckInDate,
-                CheckOutDate = booking.CheckOutDate,
-                GuestId = booking.GuestId
-            };
+                var inventoryRequest = new InventoryRequest
+                {
+                    SagaId = sagaId,
+                    BookingId = booking.BookingId,
+                    RoomId = booking.RoomId,
+                    CheckInDate = booking.CheckInDate,
+                    CheckOutDate = booking.CheckOutDate,
+                    GuestId = booking.GuestId
+                };
 
-            string topicName = _topicTranslator.GetTopicName("TOPIC_INVENTORY_REQUEST");
+                string topicName = _topicTranslator.GetTopicName("TOPIC_INVENTORY_REQUEST");
 
-            await _kafkaProducer.ProduceAsync(topicName, inventoryRequest);
+                await _kafkaProducer.ProduceAsync(topicName, inventoryRequest);
 
-            return new BookingResponse
+                await using (linkedCts.Token.Register(() => tcs.TrySetCanceled(linkedCts.Token)))
+                {
+                    var response = await tcs.Task; // This will await until TrySetResult or TrySetCanceled is called
+                    _logger.LogInformation("Saga completed: sagaId={sagaId}, status={sagaId}", sagaId, response.Status);
+                    return response;
+                }
+            }
+            catch (OperationCanceledException)
             {
-                BookingId = booking.BookingId,
-                Status = booking.Status,
-                Message = "Booking initiated successfully"
-            };
+                if (timeoutCts.IsCancellationRequested)
+                {
+                    _logger.LogWarning("Saga timeout: sagaId={sagaId}", sagaId);
+                    return new BookingResponse { BookingId = booking.BookingId, Status =BookingStatus.Failed, Message = "Booking saga timed out" };
+                }
+                throw;
+            }
+            finally
+            {
+                // Clean up the completion source, regardless of outcome
+                _completionSources.TryRemove(sagaId, out _);
+            }
         }
 
         public async Task ProcessInventoryRequestAsync(InventoryResponse message)
@@ -118,6 +145,8 @@ namespace Ophusdev.Orchestrator.Business.Services
                 string topicName = _topicTranslator.GetTopicName("TOPIC_PAYMENT_REQUEST");
 
                 await _kafkaProducer.ProduceAsync(topicName, paymentRequest);
+
+                // Here we don't notify saga because need to wait for Payment
             }
             else
             {
@@ -125,6 +154,8 @@ namespace Ophusdev.Orchestrator.Business.Services
 
                 booking.Status = BookingStatus.Failed;
                 await _bookingRepository.UpdateAsync(booking);
+
+                await NotifySagaAsync(message.SagaId, message.BookingId, booking.Status, "");
             }
         }
 
@@ -141,6 +172,8 @@ namespace Ophusdev.Orchestrator.Business.Services
                 booking.Status = BookingStatus.Paid;
                 
                 await _bookingRepository.UpdateAsync(booking);
+
+                await NotifySagaAsync(message.SagaId, message.BookingId, booking.Status, "");
 
                 _notificationService.ProduceAsyncSimulated(new NotificationRequest
                 {
@@ -160,6 +193,9 @@ namespace Ophusdev.Orchestrator.Business.Services
                 _logger.LogWarning("Payment failed, start compensation on inventory");
 
                 await CompensateInventoryAsync(booking.SagaId, message.BookingId);
+
+                await NotifySagaAsync(message.SagaId, message.BookingId, booking.Status, "");
+
             }
         }
 
@@ -180,6 +216,38 @@ namespace Ophusdev.Orchestrator.Business.Services
             string topicName = _topicTranslator.GetTopicName("TOPIC_COMPENSATION_REQUEST");
 
             await _kafkaProducer.ProduceAsync(topicName, compensationRequest);
+        }
+
+        public async Task CompleteSaga(BookingResponseSaga message)
+        {
+            if (_completionSources.TryGetValue(message.SagaId, out var tcs))
+            {
+                BookingResponse response = new BookingResponse
+                {
+                    BookingId = message.BookingId,
+                    Status = message.Status,
+                    Message = message.Message
+                };
+
+                tcs.TrySetResult(response);
+
+                _logger.LogInformation("Completed tcs: sagaId={sagaId}", message.SagaId);
+            }
+
+            _logger.LogInformation("Not found tcs: sagaId={sagaId}", message.SagaId);
+        }
+
+        private async Task NotifySagaAsync(string sagaId, string bookingId, BookingStatus status, string message = "")
+        {
+            string topicName = _topicTranslator.GetTopicName("TOPIC_SAGA_RESPONSE");
+
+            await _kafkaProducer.ProduceAsync(topicName, new BookingResponseSaga
+            {
+                SagaId = sagaId,
+                BookingId = bookingId,
+                Status = status,
+                Message = message
+            });
         }
     }
 }
