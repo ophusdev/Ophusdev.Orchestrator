@@ -1,6 +1,7 @@
 ﻿using Ophusdev.Kafka.Abstraction;
 using Ophusdev.Orchestrator.Business.Abstraction;
 using Ophusdev.Orchestrator.Business.Services;
+using Ophusdev.Orchestrator.Shared;
 using Ophusdev.Orchestrator.Shared.Models;
 
 namespace Ophusdev.Orchestrator.Api.Extensions
@@ -30,6 +31,14 @@ namespace Ophusdev.Orchestrator.Api.Extensions
                     async (bookingSagaOrchestrator, response) =>
                     {
                         await bookingSagaOrchestrator.ProcessPaymentRequestAsync(response);
+                    }
+                );
+
+                registry.RegisterTypedHandler<BookingResponseSaga>(
+                    "TOPIC_SAGA_RESPONSE",
+                    async (bookingSagaOrchestrator, response) =>
+                    {
+                        await bookingSagaOrchestrator.CompleteSaga(response);
                     }
                 );
 
