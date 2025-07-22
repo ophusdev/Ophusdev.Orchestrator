@@ -18,19 +18,22 @@ namespace Ophusdev.Orchestrator.Business.Services
         private readonly ILogger<BookingService> _logger;
         private readonly IClientHttp _clientHttp;
         private readonly ITopicTranslator _topicTranslator;
+        private readonly INotificationService _notificationService;
 
         public BookingService(
             IKafkaProducer kafkaProducer,
             IRepository bookingRepository,
             ILogger<BookingService> logger,
             ITopicTranslator topicTranslator,
-            IClientHttp clientHttp)
+            IClientHttp clientHttp,
+            INotificationService notificationService)
         {
             _kafkaProducer = kafkaProducer;
             _bookingRepository = bookingRepository;
             _logger = logger;
             _clientHttp = clientHttp;
             _topicTranslator = topicTranslator;
+            _notificationService = notificationService;
         }
 
         private async Task<RoomDto?> ReadRoomSync(int roomId)
@@ -133,12 +136,18 @@ namespace Ophusdev.Orchestrator.Business.Services
 
             if (message.Success)
             {
-                // TODO: chiamare un altro servizio per scopi didattici
                 _logger.LogInformation("Payment success, book room={roomId}", booking.RoomId);
 
                 booking.Status = BookingStatus.Paid;
                 
                 await _bookingRepository.UpdateAsync(booking);
+
+                _notificationService.ProduceAsyncSimulated(new NotificationRequest
+                {
+                    SagaId = message.SagaId,
+                    BookingId = message.BookingId,
+                    GuestId = booking.GuestId,
+                });
             }
             else
             {

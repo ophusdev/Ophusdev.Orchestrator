@@ -30,9 +30,13 @@ builder.Services.AddSingleton<IKafkaConsumer, KafkaConsumer>();
 
 builder.Services.AddScoped<IBookingService, BookingService>();
 
+builder.Services.AddSingleton<INotificationService, NotificationService>();
+
 builder.Services.AddKafkaTopicHandlers();
 
 builder.Services.AddHostedService<SagaConsumerService>();
+
+builder.Services.AddHostedService<NotificationWorker>();
 
 builder.Services.AddOphusdevInventoryClient(builder.Configuration);
 
